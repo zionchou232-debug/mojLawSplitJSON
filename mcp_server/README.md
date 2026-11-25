@@ -19,6 +19,21 @@
 4. **同義詞擴展**：`synonyms.json` 把口語換成法條用語（酒駕 → 不能安全駕駛、偷 → 竊取），長詞優先比對。
 5. **多層加權重排**：BM25 × 查詢詞命中率 × 整詞命中 × 法規位階（憲法 > 法律 > 命令）× 常用法規（刑法、刑訴…）× 查詢中點名的法規。
 6. 預設排除已廢止法規與「（刪除）」條文。
+7. **數字對照**：查詢的阿拉伯數字換成條文用的國字（`3年` → `三年`、`30萬` → `三十萬`、`110` → `一百十`）。
+8. **語意搜尋（選用）**：用 `BAAI/bge-small-zh-v1.5` 把條文轉成向量，白話問題（「被打的時候還手」）也找得到意思相近的條文；
+   再用 Reciprocal Rank Fusion 和關鍵字結果合併排名。沒建向量時自動只用關鍵字。
+
+## 開啟語意搜尋
+
+```bash
+pip install -r mcp_server/requirements-semantic.txt
+python mcp_server/build_embeddings.py --limit 500   # 先試跑，第一次會下載模型（約 100MB）
+python mcp_server/build_embeddings.py               # 憲法＋法律層級約 4 萬條，CPU 約 10–20 分鐘
+python mcp_server/eval_search.py                    # 比較 keyword / semantic / hybrid 的命中率
+```
+
+向量存在 `mcp_server/vectors/`（不進 git）。加 `--all` 連命令層級一起建（約 16 萬條，較久）。
+`search_articles` 的 `mode` 參數可指定 `hybrid`、`keyword` 或 `semantic`。
 
 ## 安裝與使用（Windows 也一樣）
 
@@ -57,6 +72,5 @@ claude mcp add taiwan-law -- python /完整路徑/mojLawSplitJSON/mcp_server/ser
 
 ## 還能再做的
 
-- 語意向量搜尋（embedding），處理同義詞表沒收錄的說法
 - 判決資料（司法院裁判書開放資料）
 - 條文中「第X條」交叉引用的連結
