@@ -5,3 +5,4 @@ __pycache__/
 judgments.db
 judgments.db-wal
 judgments.db-shm
+vectors/

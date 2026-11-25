@@ -61,11 +61,13 @@ def search_articles(
     nature: Literal["憲法", "法律", "命令"] | None = None,
     include_abolished: bool = False,
     limit: int = 10,
+    mode: Literal["auto", "hybrid", "keyword", "semantic"] = "auto",
 ) -> dict:
-    """用白話或關鍵字搜尋相關法條，例如「酒駕撞死人」「偷拍」「羈押期間」。
+    """用白話或關鍵字搜尋相關法條，例如「酒駕撞死人」「打架把人打成重傷」「罰3萬」。
 
-    會自動把口語詞換成法條用語（酒駕 → 不能安全駕駛），並依相關度、法規位階、
-    常用法規加權排序。查詢中提到法規名稱（如「刑法 追訴期」）時，該法規優先。
+    結合兩種搜尋：關鍵字（BM25）找字面命中的條文，語意搜尋找意思相近的條文，
+    再依法規位階、常用法規加權排序。口語詞會換成法條用語（酒駕 → 不能安全駕駛），
+    阿拉伯數字會換成條文用的國字（3年 → 三年）。查詢中提到法規名稱時，該法規優先。
 
     Args:
         query: 查詢內容，可以是白話描述或關鍵字，多個詞用空白分隔。
@@ -73,9 +75,10 @@ def search_articles(
         nature: 只搜尋某種位階：憲法、法律（立法院通過）、命令（行政規則、辦法等）。
         include_abolished: 是否包含已廢止的法規，預設不含。
         limit: 回傳筆數，1 到 50，預設 10。
+        mode: auto（預設，有語意向量就混合搜尋）、hybrid、keyword（只用關鍵字）、semantic（只用語意）。
     """
     return db().search(query, law=law, nature=nature,
-                       include_abolished=include_abolished, limit=limit)
+                       include_abolished=include_abolished, limit=limit, mode=mode)
 
 
 @server.tool(annotations=READ_ONLY)

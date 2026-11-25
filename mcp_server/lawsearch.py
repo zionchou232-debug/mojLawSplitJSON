@@ -132,6 +132,55 @@ def article_display(no: str) -> str:
     return f"第{main}條" + (f"之{sub}" if sub else "")
 
 
+_CN_DIGITS = "零一二三四五六七八九"
+
+
+def _four_digits(n: int) -> str:
+    """0 < n < 10000 → 國字，例如 305 → 三百零五。"""
+    out, zero = "", False
+    for unit_val, unit in ((1000, "千"), (100, "百"), (10, "十"), (1, "")):
+        d = n // unit_val % 10
+        if d:
+            if zero and out:
+                out += "零"
+            if unit == "十" and d == 1 and out and not out.endswith("零"):
+                out += "十"  # 法條慣用「一百十條」而非「一百一十條」
+            else:
+                out += _CN_DIGITS[d] + unit
+            zero = False
+        elif out:
+            zero = True
+    return out
+
+
+def int_to_chinese(n: int) -> str:
+    """法條常見寫法：3 → 三、10 → 十、15 → 十五、300000 → 三十萬、2000000 → 二百萬。"""
+    if n == 0:
+        return "零"
+    parts, groups = [], [(n // 10**8) % 10**4, (n // 10**4) % 10**4, n % 10**4]
+    for g, unit in zip(groups, ("億", "萬", "")):
+        if g:
+            if parts and g < 1000:
+                parts.append("零")
+            parts.append(_four_digits(g) + unit)
+    s = "".join(parts)
+    return s[1:] if s.startswith("一十") else s
+
+
+def numbers_to_chinese(text: str) -> str:
+    """把查詢裡的阿拉伯數字換成國字：『3年』→『三年』、『0.25』→『零點二五』。"""
+    text = text.translate(str.maketrans("０１２３４５６７８９．", "0123456789."))
+
+    def repl(m: re.Match) -> str:
+        whole, frac = m.group(1).replace(",", ""), m.group(2)
+        s = int_to_chinese(int(whole))
+        if frac:
+            s += "點" + "".join(_CN_DIGITS[int(c)] for c in frac)
+        return s
+
+    return re.sub(r"(\d[\d,]*)(?:\.(\d+))?", repl, text)
+
+
 # ---------------------------------------------------------------- 資料庫
 
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -163,7 +212,8 @@ class Law:
 
 
 class LawDB:
-    def __init__(self, db_path: Path = DB_PATH, synonyms_path: Path = SYNONYMS_PATH):
+    def __init__(self, db_path: Path = DB_PATH, synonyms_path: Path = SYNONYMS_PATH,
+                 vectors=None, load_vectors: bool = True):
         self.conn = connect(db_path)
         self.synonyms = load_synonyms(synonyms_path)
         self.laws: dict[str, Law] = {}
@@ -179,6 +229,14 @@ class LawDB:
                     self.name_index[alias] = law.pcode
         # 長的名稱先比對，避免「刑法」搶走「陸海空軍刑法」
         self._names_by_len = sorted(self.name_index, key=len, reverse=True)
+        # 語意向量：傳入 vectors 就用，否則試著載入 mcp_server/vectors/ 下的檔案
+        if vectors is None and load_vectors:
+            try:
+                from semantic import try_load
+                vectors = try_load()
+            except Exception:  # 沒裝 numpy/fastembed 或檔案壞了，就只用關鍵字
+                vectors = None
+        self.vectors = vectors
 
     # ------------------------------------------------------------ 法規名稱
 
@@ -285,9 +343,18 @@ class LawDB:
         nature: str | None = None,
         include_abolished: bool = False,
         limit: int = 10,
+        mode: str = "auto",
     ) -> dict:
+        """mode：auto（有語意向量就用混合，否則關鍵字）、hybrid、keyword、semantic。"""
         limit = max(1, min(int(limit), 50))
         notes: list[str] = []
+        if mode not in ("auto", "hybrid", "keyword", "semantic"):
+            mode = "auto"
+        if mode == "auto":
+            mode = "hybrid" if self.vectors is not None else "keyword"
+        elif mode in ("hybrid", "semantic") and self.vectors is None:
+            notes.append("尚未建立語意向量（build_embeddings.py），這次只用關鍵字搜尋")
+            mode = "keyword"
 
         # 1. 法規範圍：明確指定 > 從查詢裡偵測
         target: Law | None = None
@@ -303,11 +370,16 @@ class LawDB:
             if target:
                 notes.append(f"查詢中提到「{target.name}」，該法規的條文會優先")
 
-        # 2. 同義詞擴展
-        terms, expanded = self.expand_query(query)
+        # 2. 數字對照：條文用國字，查詢的「3年」換成「三年」
+        q_norm = numbers_to_chinese(query)
+        if q_norm != query:
+            notes.append(f"數字對照：以「{q_norm}」搜尋")
+
+        # 3. 同義詞擴展
+        terms, expanded = self.expand_query(q_norm)
         if expanded:
             notes.append("同義詞擴展：" + "、".join(expanded))
-        q_for_tokens = query
+        q_for_tokens = q_norm
         if target and not hard_filter:
             for n in self._names_by_len:
                 if n in q_for_tokens and self.name_index[n] == target.pcode:
@@ -318,31 +390,63 @@ class LawDB:
         if not all_tokens:
             return {"results": [], "notes": notes + ["查詢內容太短或只有標點"]}
 
-        # 3. FTS5 BM25 初篩：雙字詞 OR 查詢
-        match = " OR ".join('"' + t.replace('"', '""') + '"' for t in all_tokens)
-        where, params = ["articles_fts MATCH ?"], [match]
+        # 共用的篩選條件
+        filt, fparams = [], []
         if hard_filter and target:
-            where.append("a.pcode = ?")
-            params.append(target.pcode)
+            filt.append("a.pcode = ?")
+            fparams.append(target.pcode)
         if nature:
-            where.append("l.nature = ?")
-            params.append(nature)
+            filt.append("l.nature = ?")
+            fparams.append(nature)
         if not include_abolished:
-            where.append("l.abolished = 0")
-        where.append("a.text NOT IN ('（刪除）', '(刪除)')")  # 已刪除的條文不列入
-        sql = f"""
-            SELECT a.*, bm25(articles_fts, 1.0, 0.6) AS bm
-            FROM articles_fts JOIN articles a ON a.id = articles_fts.rowid
-            JOIN laws l ON l.pcode = a.pcode
-            WHERE {' AND '.join(where)}
-            ORDER BY bm LIMIT 400
-        """
-        rows = self.conn.execute(sql, params).fetchall()
+            filt.append("l.abolished = 0")
+        filt.append("a.text NOT IN ('（刪除）', '(刪除)')")  # 已刪除的條文不列入
 
-        # 4. 多層加權重排
+        # 4a. 關鍵字：FTS5 BM25，雙字詞 OR 查詢
+        kw_rows: list[sqlite3.Row] = []
+        if mode in ("hybrid", "keyword"):
+            match = " OR ".join('"' + t.replace('"', '""') + '"' for t in all_tokens)
+            sql = f"""
+                SELECT a.*, bm25(articles_fts, 1.0, 0.6) AS bm
+                FROM articles_fts JOIN articles a ON a.id = articles_fts.rowid
+                JOIN laws l ON l.pcode = a.pcode
+                WHERE articles_fts MATCH ? AND {' AND '.join(filt)}
+                ORDER BY bm LIMIT 400
+            """
+            kw_rows = self.conn.execute(sql, [match] + fparams).fetchall()
+
+        # 4b. 語意：向量相似度（白話描述也找得到，不必剛好用到條文的字）
+        sem: dict[int, tuple[int, float]] = {}  # 條文 id → (名次, 相似度)
+        if mode in ("hybrid", "semantic"):
+            hits = self.vectors.search(q_norm, top_k=600)
+            ids = [i for i, _ in hits]
+            ok = set()
+            for chunk in range(0, len(ids), 500):
+                part = ids[chunk:chunk + 500]
+                sql = f"""
+                    SELECT a.id FROM articles a JOIN laws l ON l.pcode = a.pcode
+                    WHERE a.id IN ({','.join('?' * len(part))}) AND {' AND '.join(filt)}
+                """
+                ok.update(r[0] for r in self.conn.execute(sql, part + fparams))
+            for i, sim in hits:
+                if i in ok and len(sem) < 300:
+                    sem[i] = (len(sem) + 1, sim)
+
+        # 5. 合併候選
+        rows: dict[int, sqlite3.Row] = {r["id"]: r for r in kw_rows}
+        kw_rank = {r["id"]: n + 1 for n, r in enumerate(kw_rows)}
+        missing = [i for i in sem if i not in rows]
+        for chunk in range(0, len(missing), 500):
+            part = missing[chunk:chunk + 500]
+            for r in self.conn.execute(
+                f"SELECT a.*, 0.0 AS bm FROM articles a WHERE a.id IN ({','.join('?' * len(part))})", part
+            ):
+                rows[r["id"]] = r
+
+        # 6. 多層加權重排
         phrases = [t for t in terms if len(t) >= 2] + [e for e in expanded if len(e) >= 2]
         scored = []
-        for r in rows:
+        for aid, r in rows.items():
             lw = self.laws[r["pcode"]]
             hay = r["text"] + " " + (r["chapter"] or "")
             hay_tokens = set(tokenize(hay))
@@ -350,9 +454,21 @@ class LawDB:
             syn_cov = sum(t in hay_tokens for t in syn_tokens) / max(len(syn_tokens), 1) if syn_tokens else 0
             coverage = max(base_cov, syn_cov) * 0.7 + min(base_cov, syn_cov) * 0.3 if syn_tokens else base_cov
             phrase_hits = sum(1 for p in phrases if p in hay)
-            score = -r["bm"]                                   # BM25（越大越相關）
-            score *= 0.4 + coverage                            # 命中率：查詢詞涵蓋越多越好
-            score *= 1 + 0.25 * min(phrase_hits, 4)            # 整詞命中加分
+            if mode == "keyword":
+                score = -r["bm"]                               # BM25（越大越相關）
+                score *= 0.4 + coverage                        # 命中率：查詢詞涵蓋越多越好
+                score *= 1 + 0.25 * min(phrase_hits, 4)        # 整詞命中加分
+            else:
+                # Reciprocal Rank Fusion：兩邊名次都前面的條文分數最高
+                k = 60
+                score = 0.0
+                if aid in kw_rank:
+                    score += 1 / (k + kw_rank[aid])
+                if aid in sem:
+                    score += 1.2 / (k + sem[aid][0])           # 語意略加重
+                score *= 100
+                score *= 0.7 + 0.5 * coverage
+                score *= 1 + 0.15 * min(phrase_hits, 4)
             score *= NATURE_WEIGHT.get(lw.nature, 1.0)         # 法規位階
             score *= POPULAR_LAWS.get(lw.pcode, 1.0)           # 常用法規
             if target and lw.pcode == target.pcode:
@@ -365,11 +481,17 @@ class LawDB:
             d = self._article_dict(r, lw)
             d["text"] = make_snippet(d["text"], phrases or terms)
             d["score"] = round(score, 3)
-            d["match"] = {"coverage": round(cov, 2), "phrase_hits": ph}
+            m = {"coverage": round(cov, 2), "phrase_hits": ph}
+            if mode != "keyword":
+                m["keyword_rank"] = kw_rank.get(r["id"])
+                if r["id"] in sem:
+                    m["semantic_rank"], sim = sem[r["id"]]
+                    m["semantic_similarity"] = round(sim, 3)
+            d["match"] = m
             results.append(d)
         if not results:
             notes.append("沒有找到相關條文，可以換個說法或拿掉法規限制再試")
-        return {"query": query, "results": results, "notes": notes}
+        return {"query": query, "mode": mode, "results": results, "notes": notes}
 
 
 def make_snippet(text: str, phrases: list[str], width: int = 160) -> str:
