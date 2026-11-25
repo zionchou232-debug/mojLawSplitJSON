@@ -1,0 +1,4 @@
+laws.db
+laws.tmp
+__pycache__/
+.pytest_cache/
