@@ -10,6 +10,11 @@
 | `get_article` | 取某法某條的原文，附官方連結。找不到就明說，不讓 AI 自己編 | `刑法` + `第一百八十五條之三` |
 | `search_articles` | 白話或關鍵字搜尋條文 | `酒駕撞死人`、`偷拍`、`羈押 期間`（限 `刑訴`） |
 | `find_law` | 依名稱或簡稱找法規 | `毒品`、`跟騷法` |
+| `search_judgments` | 關鍵字或白話搜尋刑事判決，可篩法院、審級、年度 | `酒駕 撞死`、`詐騙 車手` |
+| `get_judgment` | 依案號取判決全文（太長會分段） | `最高法院112年度台上字第1234號`、`112台上1234` |
+| `find_judgments_by_article` | 找引用某條文的判決，最高法院優先、新到舊 | `刑法` + `339之4` |
+
+判決工具要先建好判決資料庫（見下方「判決資料庫」）；沒建的話，這三個工具會提示怎麼建，條文工具照常可用。
 
 ## 搜尋怎麼強化的（參考 TaiLexi AI 的公開設計）
 
@@ -70,7 +75,47 @@ claude mcp add taiwan-law -- python /完整路徑/mojLawSplitJSON/mcp_server/ser
 
 上游 [kong0107/mojLawSplitJSON](https://github.com/kong0107/mojLawSplitJSON) 會定期更新。在 GitHub 按 Sync fork 或 `git pull` 後，重跑 `build_index.py` 即可。
 
+## 判決資料庫
+
+資料來源是[司法院裁判書開放資料](https://opendata.judicial.gov.tw/)，每月發布一包壓縮檔。
+`update_judgments.py` 會下載、只挑**刑事判決**（不收裁定、民事、行政、附帶民事），存進 `mcp_server/judgments.db`。
+
+**空間怎麼省**
+
+- 原始壓縮檔放 `--raw-dir`，建議指向 **Google Drive 電腦版的串流資料夾**（例如 `G:\我的雲端硬碟\判決原始檔`），檔案只佔雲端空間。
+- 本機只留 `judgments.db`：判決全文用 zlib 壓縮；搜尋索引只收案由、主文與全文前 3000 字（`--index-chars` 可調）。
+- 解壓時會在本機暫存一個月份的檔案，處理完立刻刪掉。暫存位置可用 `--temp-dir` 指定。
+
+**第一次建立**（先跑一個月試試看大小）
+
+```bash
+# 先確認平台上有哪些月份（不下載）
+python mcp_server/update_judgments.py --probe
+# 下載並匯入一個月，看實際大小
+python mcp_server/update_judgments.py --raw-dir "G:\我的雲端硬碟\判決原始檔" --max-new 1
+python mcp_server/update_judgments.py --stats
+# 沒問題就跑完近 3 年（預設 --months 36）
+python mcp_server/update_judgments.py --raw-dir "G:\我的雲端硬碟\判決原始檔"
+```
+
+- 平台若要求會員登入，先在平台註冊，再設定環境變數 `JUDICIAL_USER`、`JUDICIAL_PASSWORD`。
+- 自動下載失敗時，可以用瀏覽器從平台手動下載壓縮檔丟進 `--raw-dir`，再加 `--no-download` 執行。
+- 解壓 rar 用 Windows 10 以上內建的 `tar` 指令，不用另外裝軟體。
+- 重跑不會重複下載或重複匯入；已匯入的壓縮檔記在資料庫的 `ingested` 表。
+- 法條引用要靠 `laws.db` 認法規名稱，所以要先跑過 `build_index.py`。
+
+**每兩週自動更新（Windows 工作排程器）**
+
+在「命令提示字元」執行一次（路徑換成你自己的；`python.exe` 用虛擬環境裡的那個）：
+
+```bat
+schtasks /Create /TN "判決資料庫更新" /SC DAILY /MO 14 /ST 03:00 /TR "\"C:\完整路徑\mojLawSplitJSON\.venv\Scripts\python.exe\" \"C:\完整路徑\mojLawSplitJSON\mcp_server\update_judgments.py\" --raw-dir \"G:\我的雲端硬碟\判決原始檔\""
+```
+
+開放資料一個月發布一次，每 14 天檢查一次就不會漏。電腦在排定時間關機的話，到「工作排程器」裡把這個工作的「錯過排程時儘快執行」打勾。
+更新時 MCP server 可以照常使用（資料庫用 WAL 模式）。
+
 ## 還能再做的
 
-- 判決資料（司法院裁判書開放資料）
+- 判決的語意搜尋（BGE-M3 向量，存本機）
 - 條文中「第X條」交叉引用的連結

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
 
+from judgments import JUDGMENT_DB_PATH, JudgmentDB  # noqa: E402
 from lawsearch import LawDB  # noqa: E402
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
@@ -24,10 +25,13 @@ server = MCPServer(
         "查詢中華民國（台灣）現行法規條文。引用法條前，先用 get_article 取得原文，"
         "不要憑記憶引用。不知道條號時用 search_articles 以白話搜尋。"
         "回傳的 source_url 是全國法規資料庫的官方連結，回答時請附上。"
+        "要找實務見解時，用 search_judgments 搜判決、find_judgments_by_article 找引用某條文的判決，"
+        "get_judgment 依案號取全文。判決只收本機已下載的刑事判決，引用時附上 source_url（司法院裁判書查詢）。"
     ),
 )
 
 _db: LawDB | None = None
+_jdb: JudgmentDB | None = None
 
 
 def db() -> LawDB:
@@ -88,6 +92,95 @@ def find_law(name: str, include_abolished: bool = False) -> dict:
             for x in laws
         ]
     }
+
+
+def jdb() -> JudgmentDB | None:
+    global _jdb
+    if _jdb is None and JUDGMENT_DB_PATH.exists():
+        try:
+            law_db = db()
+        except FileNotFoundError:
+            law_db = None
+        _jdb = JudgmentDB(JUDGMENT_DB_PATH, law_db=law_db)
+    return _jdb
+
+
+NO_JDB = {"results": [], "notes": [
+    "還沒有判決資料庫。請先執行 python mcp_server/update_judgments.py --raw-dir <原始檔資料夾>"]}
+
+Level = Literal["最高法院", "高等法院", "地方法院"]
+
+
+@server.tool(annotations=READ_ONLY)
+def search_judgments(
+    query: str,
+    court: str | None = None,
+    level: Level | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    limit: int = 10,
+) -> dict:
+    """用關鍵字或白話搜尋刑事判決，例如「酒駕 累犯 易科罰金」「詐騙 車手 加重詐欺」。
+
+    搜尋範圍是案由、主文與判決前段（事實、理由開頭）。最高法院、高等法院的判決會稍微優先。
+
+    Args:
+        query: 查詢內容，多個詞用空白分隔。
+        court: 只找某法院，可寫部分名稱，例如「臺北地方法院」「高等法院臺中分院」。
+        level: 只找某審級：最高法院、高等法院、地方法院。
+        year_from: 從民國幾年度起（案號年度），例如 112。
+        year_to: 到民國幾年度止。
+        limit: 回傳筆數，1 到 50，預設 10。
+    """
+    j = jdb()
+    if j is None:
+        return NO_JDB
+    return j.search(query, court=court, level=level, year_from=year_from, year_to=year_to, limit=limit)
+
+
+@server.tool(annotations=READ_ONLY)
+def get_judgment(case: str, court: str | None = None, offset: int = 0, max_chars: int = 20000) -> dict:
+    """依案號取刑事判決全文，例如「最高法院112年度台上字第1234號」「112台上1234」。
+
+    判決很長時會分段回傳，用回傳的 next_offset 再呼叫一次取下一段。
+    找不到時 found 為 false；請不要自行編造判決內容。
+
+    Args:
+        case: 案號，「臺」「台」都可以，也接受司法院的 JID（TPSM,112,台上,1234,20230510,1）。
+        court: 同一案號有多個法院時，指定法院名稱。
+        offset: 從全文第幾個字開始。
+        max_chars: 這次最多回傳幾個字，預設 20000。
+    """
+    j = jdb()
+    if j is None:
+        return {"found": False, "reason": NO_JDB["notes"][0]}
+    return j.get(case, court=court, offset=offset, max_chars=max_chars)
+
+
+@server.tool(annotations=READ_ONLY)
+def find_judgments_by_article(
+    law: str,
+    article: str,
+    court: str | None = None,
+    level: Level | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    limit: int = 10,
+) -> dict:
+    """找引用某法某條的刑事判決，例如 刑法 第339條之4、毒品危害防制條例 第4條。
+
+    依法院層級（最高法院優先）、日期新到舊排序，並回傳總共有幾份判決引用。
+
+    Args:
+        law: 法規名稱或簡稱，跟 get_article 一樣，例如「刑法」「毒品條例」。
+        article: 條號，例如「339-4」「第三百三十九條之四」。
+        court, level, year_from, year_to, limit: 同 search_judgments。
+    """
+    j = jdb()
+    if j is None:
+        return NO_JDB
+    return j.by_article(law, article, court=court, level=level,
+                        year_from=year_from, year_to=year_to, limit=limit)
 
 
 if __name__ == "__main__":
