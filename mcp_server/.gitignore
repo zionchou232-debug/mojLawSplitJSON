@@ -2,3 +2,6 @@ laws.db
 laws.tmp
 __pycache__/
 .pytest_cache/
+judgments.db
+judgments.db-wal
+judgments.db-shm
