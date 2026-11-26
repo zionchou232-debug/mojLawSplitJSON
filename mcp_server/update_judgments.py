@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import datetime as dt
 import json
 import os
@@ -127,10 +128,17 @@ def download(item: dict, raw_dir: Path, token: str | None = None) -> Path:
     for attempt in range(4):
         try:
             with http_get(url, token, timeout=300) as r, open(part, "wb") as f:
+                expected = int(r.headers.get("Content-Length") or 0)
                 shutil.copyfileobj(r, f, length=1 << 20)
+            got = part.stat().st_size
+            # 連線中途斷掉時，有時不會丟出錯誤，只會拿到半個檔：核對大小，不對就重下
+            if expected and got != expected:
+                raise ConnectionError(f"檔案不完整（{got} / {expected} bytes）")
+            if got < 1024:
+                raise ConnectionError(f"檔案太小（{got} bytes），可能是錯誤訊息而不是壓縮檔")
             part.replace(dest)
             return dest
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
             log(f"  下載失敗（第 {attempt + 1} 次）：{e}")
             time.sleep(10 * (attempt + 1))
     raise RuntimeError(f"下載 {item['month']} 失敗")

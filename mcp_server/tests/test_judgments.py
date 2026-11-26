@@ -2,6 +2,7 @@
 
 執行：python -m pytest mcp_server/tests（需先 build_index.py 產生 laws.db）
 """
+import io
 import json
 import sys
 import zipfile
@@ -244,3 +245,25 @@ def test_semantic_falls_back_without_vectors(jdb):
         assert r["mode"] == "keyword" and r["notes"]
     finally:
         jdb.vectors = saved
+
+
+class _FakeResp(io.BytesIO):
+    def __init__(self, data: bytes, length: int):
+        super().__init__(data)
+        self.headers = {"Content-Length": str(length)}
+
+
+def test_download_rejects_truncated_file(tmp_path, monkeypatch):
+    payload = b"R" * 4096
+    calls = []
+
+    def fake_get(url, token=None, timeout=60):
+        calls.append(1)
+        # 第一次只給一半（模擬斷線），第二次給完整檔案
+        return _FakeResp(payload[:2048] if len(calls) == 1 else payload, len(payload))
+
+    monkeypatch.setattr(update_judgments, "http_get", fake_get)
+    monkeypatch.setattr(update_judgments.time, "sleep", lambda s: None)
+    item = {"month": "202603", "fileset_id": 1, "format": "rar"}
+    path = update_judgments.download(item, tmp_path)
+    assert len(calls) == 2 and path.read_bytes() == payload
