@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
 
+from crimes import CrimeBook  # noqa: E402
 from judgments import JUDGMENT_DB_PATH, JudgmentDB  # noqa: E402
 from lawsearch import LawDB  # noqa: E402
 
@@ -27,6 +28,8 @@ server = MCPServer(
         "回傳的 source_url 是全國法規資料庫的官方連結，回答時請附上。"
         "要找實務見解時，用 search_judgments 搜判決、find_judgments_by_article 找引用某條文的判決，"
         "get_judgment 依案號取全文。判決只收本機已下載的刑事判決，引用時附上 source_url（司法院裁判書查詢）。"
+        "檢察官實務：get_crime_elements 取某罪的構成要件拆解，get_evidence_checklist 取蒐證檢核清單，"
+        "list_crimes 列出已有的罪名卡。偵查不公開：不要要求使用者提供或貼上案情、卷證內容。"
     ),
 )
 
@@ -181,6 +184,58 @@ def find_judgments_by_article(
         return NO_JDB
     return j.by_article(law, article, court=court, level=level,
                         year_from=year_from, year_to=year_to, limit=limit)
+
+
+_book: CrimeBook | None = None
+
+
+def book() -> CrimeBook:
+    global _book
+    if _book is None:
+        _book = CrimeBook.load()
+    return _book
+
+
+def _law_db_or_none() -> LawDB | None:
+    try:
+        return db()
+    except FileNotFoundError:
+        return None
+
+
+@server.tool(annotations=READ_ONLY)
+def list_crimes() -> dict:
+    """列出目前有哪些罪名卡（構成要件拆解與蒐證檢核清單），以及每張卡是否已經檢察官審閱。"""
+    return {"results": book().list()}
+
+
+@server.tool(annotations=READ_ONLY)
+def get_crime_elements(crime: str, include_article_text: bool = True) -> dict:
+    """取得某罪的構成要件拆解：客觀、主觀要件、加重要件，各要件的說明、應蒐集證據與常見爭點，
+    以及起訴前確認事項、罪數競合、沒收注意事項。相關條文的原文從法規資料庫即時附上。
+
+    status 為 draft 時，內容是尚未經檢察官審閱的草稿，回答時要提醒使用者。
+    只接受罪名或條號，不需要也不要要求案情。
+
+    Args:
+        crime: 罪名、簡稱或條號，例如「酒駕」「加重詐欺」「人頭帳戶」「施用毒品」「339-4」「320」。
+        include_article_text: 是否附上相關條文原文，預設是。
+    """
+    return book().get(crime, law_db=_law_db_or_none() if include_article_text else None,
+                      include_article_text=include_article_text)
+
+
+@server.tool(annotations=READ_ONLY)
+def get_evidence_checklist(crime: str, format: Literal["markdown", "json"] = "markdown") -> dict:
+    """取得某罪的蒐證檢核清單，依構成要件分組，另附起訴前確認事項與沒收事項。
+
+    markdown 格式用「- [ ]」排版，可以直接存檔或印出來勾選。勾選請在本機進行，不要把案情貼回對話。
+
+    Args:
+        crime: 罪名、簡稱或條號，同 get_crime_elements。
+        format: markdown（預設，附 markdown 欄位）或 json（只回分組資料）。
+    """
+    return book().checklist(crime, fmt=format)
 
 
 if __name__ == "__main__":
