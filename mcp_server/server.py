@@ -101,7 +101,12 @@ def jdb() -> JudgmentDB | None:
             law_db = db()
         except FileNotFoundError:
             law_db = None
-        _jdb = JudgmentDB(JUDGMENT_DB_PATH, law_db=law_db)
+        try:
+            from judgment_vectors import try_load as load_judgment_vectors
+            vectors = load_judgment_vectors()
+        except Exception:  # noqa: BLE001  沒裝 numpy 等情況，退回只用關鍵字
+            vectors = None
+        _jdb = JudgmentDB(JUDGMENT_DB_PATH, law_db=law_db, vectors=vectors)
     return _jdb
 
 
@@ -119,10 +124,12 @@ def search_judgments(
     year_from: int | None = None,
     year_to: int | None = None,
     limit: int = 10,
+    mode: Literal["auto", "hybrid", "keyword", "semantic"] = "auto",
 ) -> dict:
-    """用關鍵字或白話搜尋刑事判決，例如「酒駕 累犯 易科罰金」「詐騙 車手 加重詐欺」。
+    """用關鍵字或白話搜尋刑事判決，例如「酒駕 累犯 易科罰金」，或直接描述案情
+    「朋友借車給我，我喝酒後開車撞到機車騎士」找事實相近的判決。
 
-    搜尋範圍是案由、主文與判決前段（事實、理由開頭）。最高法院、高等法院的判決會稍微優先。
+    搜尋範圍是案由、主文與判決前段（事實、理由開頭）。有判決向量時預設混合關鍵字與語意搜尋。
 
     Args:
         query: 查詢內容，多個詞用空白分隔。
@@ -131,11 +138,34 @@ def search_judgments(
         year_from: 從民國幾年度起（案號年度），例如 112。
         year_to: 到民國幾年度止。
         limit: 回傳筆數，1 到 50，預設 10。
+        mode: auto（預設）、hybrid、keyword（只用關鍵字）、semantic（只用語意，適合描述案情）。
     """
     j = jdb()
     if j is None:
         return NO_JDB
-    return j.search(query, court=court, level=level, year_from=year_from, year_to=year_to, limit=limit)
+    return j.search(query, court=court, level=level, year_from=year_from, year_to=year_to,
+                    limit=limit, mode=mode)
+
+
+@server.tool(annotations=READ_ONLY)
+def find_similar_judgments(
+    case: str,
+    court: str | None = None,
+    level: Level | None = None,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    limit: int = 10,
+) -> dict:
+    """找跟某件判決事實最相近的其他刑事判決（語意比對，需要判決向量）。
+
+    Args:
+        case: 案號，例如「最高法院112年度台上字第1234號」。
+        court, level, year_from, year_to, limit: 同 search_judgments。
+    """
+    j = jdb()
+    if j is None:
+        return NO_JDB
+    return j.similar(case, court=court, level=level, year_from=year_from, year_to=year_to, limit=limit)
 
 
 @server.tool(annotations=READ_ONLY)

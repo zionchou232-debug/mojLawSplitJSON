@@ -12,6 +12,7 @@
 | `find_law` | 依名稱或簡稱找法規 | `毒品`、`跟騷法` |
 | `search_judgments` | 關鍵字或白話搜尋刑事判決，可篩法院、審級、年度 | `酒駕 撞死`、`詐騙 車手` |
 | `get_judgment` | 依案號取判決全文（太長會分段） | `最高法院112年度台上字第1234號`、`112台上1234` |
+| `find_similar_judgments` | 找跟某件判決事實相近的判決（需要判決向量） | `最高法院112年度台上字第1234號` |
 | `find_judgments_by_article` | 找引用某條文的判決，最高法院優先、新到舊 | `刑法` + `339之4` |
 
 判決工具要先建好判決資料庫（見下方「判決資料庫」）；沒建的話，這三個工具會提示怎麼建，條文工具照常可用。
@@ -115,7 +116,22 @@ schtasks /Create /TN "判決資料庫更新" /SC DAILY /MO 14 /ST 03:00 /TR "\"C
 開放資料一個月發布一次，每 14 天檢查一次就不會漏。電腦在排定時間關機的話，到「工作排程器」裡把這個工作的「錯過排程時儘快執行」打勾。
 更新時 MCP server 可以照常使用（資料庫用 WAL 模式）。
 
+## 判決語意搜尋（用 Colab 的 GPU 算向量）
+
+關鍵字很難找「事實相近」的案子，所以判決也可以做語意搜尋。判決量大，電腦的 CPU 算太慢，改用 Google Colab 免費 GPU：
+
+1. 在 Google Drive 打開 [`mcp_server/colab/judgment_embeddings.ipynb`](colab/judgment_embeddings.ipynb)
+   （或在 Colab「檔案 → 開啟筆記本 → GitHub」貼上本 repo 網址），執行階段選 **T4 GPU**，按「全部執行」。
+2. 它會讀 Google Drive 的「判決原始檔」，挑出刑事判決，用 **BAAI/bge-m3** 算向量，每個月存一組到「判決向量」資料夾。
+   **斷線重跑會自動接續**，已算好的月份會跳過。
+3. 電腦上：`pip install -r mcp_server/requirements-semantic.txt`，並把 MCP server 的環境變數
+   `JUDGMENT_VECTOR_DIR` 設成 `G:\我的雲端硬碟\判決向量`（Claude Desktop 設定裡的 `"env"`）。
+   第一次查詢會下載 bge-m3 的 ONNX 檔（約 2.3GB），之後查詢只用 CPU。
+
+有向量時，`search_judgments` 預設混合關鍵字與語意（Reciprocal Rank Fusion），也可以用 `mode="semantic"` 直接描述案情；
+`find_similar_judgments` 找跟某件判決事實相近的案子。送進模型的文字是「案由＋事實／理由前 1500 字」（`judgments.fact_passage`），
+Colab 跟本機用同一個函式。向量用 float16 存、查詢時分塊計算，不會一次吃掉大量記憶體。
+
 ## 還能再做的
 
-- 判決的語意搜尋（BGE-M3 向量，存本機）
 - 條文中「第X條」交叉引用的連結

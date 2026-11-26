@@ -164,3 +164,69 @@ def test_find_by_article(jdb):
 ])
 def test_find_month(text, want):
     assert update_judgments.find_month(text) == want
+
+
+# ---------------------------------------------------------------- 語意向量（用假模型測流程）
+
+import zlib  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from judgment_vectors import JudgmentVectors, save_month  # noqa: E402
+from judgments import fact_passage  # noqa: E402
+from lawsearch import tokenize  # noqa: E402
+
+
+class BigramEmbedder:
+    """測試用：雙字詞雜湊成 256 維，意思相近就是用字相近。"""
+    name = "test-bigram"
+
+    def embed(self, text: str) -> np.ndarray:
+        v = np.zeros(256, dtype=np.float32)
+        for t in tokenize(text):
+            v[zlib.crc32(t.encode()) % 256] += 1
+        return v / max(np.linalg.norm(v), 1e-9)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self.embed(text)
+
+
+def test_fact_passage_skips_header():
+    p = fact_passage(HIGH, "公共危險")
+    assert p.startswith("公共危險：理由") and "酒後駕車" in p and "上訴人" not in p
+
+
+@pytest.fixture(scope="module")
+def jdb_vec(jdb, tmp_path_factory):
+    emb = BigramEmbedder()
+    out = tmp_path_factory.mktemp("vec")
+    docs = [d for d in DOCS if parse_judgment(d) and parse_judgment(d).kind == "判決"]
+    vecs = np.stack([emb.embed(fact_passage(d["JFULL"], d["JTITLE"])) for d in docs])
+    save_month(out, "裁判書_202405_1", [d["JID"] for d in docs], vecs, emb.name)
+    assert not list(out.glob("*.tmp*"))
+    jdb.vectors = JudgmentVectors(out, embedder=emb)
+    yield jdb
+    jdb.vectors = None
+
+
+def test_semantic_search(jdb_vec):
+    assert jdb_vec.vectors.count == 2
+    r = jdb_vec.search("酒後駕車撞死行人", mode="semantic")
+    assert r["mode"] == "semantic" and r["results"][0]["jid"].startswith("TCHM")
+    r = jdb_vec.search("詐欺 車手")
+    assert r["mode"] == "hybrid" and r["results"][0]["jid"].startswith("TPSM")
+    assert "keyword_rank" in r["results"][0]["match"]
+
+
+def test_similar_judgments(jdb_vec):
+    r = jdb_vec.similar("112台上1234")
+    assert [x["jid"][:4] for x in r["results"]] == ["TCHM"]
+
+
+def test_semantic_falls_back_without_vectors(jdb):
+    saved, jdb.vectors = jdb.vectors, None
+    try:
+        r = jdb.search("酒駕", mode="semantic")
+        assert r["mode"] == "keyword" and r["notes"]
+    finally:
+        jdb.vectors = saved
