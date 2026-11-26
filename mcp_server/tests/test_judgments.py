@@ -2,6 +2,7 @@
 
 執行：python -m pytest mcp_server/tests（需先 build_index.py 產生 laws.db）
 """
+import io
 import json
 import sys
 import zipfile
@@ -85,6 +86,7 @@ def jdb(tmp_path_factory, law_db):
     args = ["--raw-dir", str(raw), "--db", str(db_path), "--no-download", "--months", "1200"]
     assert update_judgments.main(args) == 0
     assert update_judgments.main(args) == 0  # 重跑不會重複匯入
+    assert update_judgments.main(args + ["--reimport"]) == 0  # 重新掃描也不會重複
     return JudgmentDB(db_path, law_db=law_db)
 
 
@@ -94,6 +96,19 @@ def test_classify():
     assert classify(CIVIL) is None
     assert classify(INCIDENTAL_CIVIL) is None
     assert classify("臺灣臺北地方法院刑事簡易判決\n113年度簡字第1號") == "判決"
+
+
+@pytest.mark.parametrize("jid,case,full,want", [
+    ("ILDM,111,訴,229,20231228,2", "訴", "臺灣宜蘭地方法院宣示判決筆錄\n111年度訴字第229號\n公訴人", "判決"),
+    ("TPHM,112,少上訴,18,20231201,1", "少上訴", "臺灣高等法院少年法庭判決\n112年度少上訴字第18號", "判決"),
+    ("TNDM,112,易,1118,20231205,1", "易", "112年度易字第1118號\n公訴人 臺灣臺南地方檢察署\n判決如下", "判決"),
+    ("TPDM,112,附民,5,20231205,1", "附民", "臺灣臺北地方法院判決\n112年度附民字第5號", None),
+    ("TPDM,112,秩,5,20231205,1", "秩", "臺灣臺北地方法院裁定\n112年度秩字第5號", None),
+    ("TPDV,112,訴,5,20231205,1", "訴", "臺灣臺北地方法院判決", None),
+])
+def test_classify_by_jid_fallback(jid, case, full, want):
+    j = parse_judgment({"JID": jid, "JCASE": case, "JFULL": full, "JTITLE": ""})
+    assert (j.kind if j else None) == want
 
 
 def test_parse_judgment_court():
@@ -164,3 +179,91 @@ def test_find_by_article(jdb):
 ])
 def test_find_month(text, want):
     assert update_judgments.find_month(text) == want
+
+
+# ---------------------------------------------------------------- 語意向量（用假模型測流程）
+
+import zlib  # noqa: E402
+
+import numpy as np  # noqa: E402
+
+from judgment_vectors import JudgmentVectors, save_month  # noqa: E402
+from judgments import fact_passage  # noqa: E402
+from lawsearch import tokenize  # noqa: E402
+
+
+class BigramEmbedder:
+    """測試用：雙字詞雜湊成 256 維，意思相近就是用字相近。"""
+    name = "test-bigram"
+
+    def embed(self, text: str) -> np.ndarray:
+        v = np.zeros(256, dtype=np.float32)
+        for t in tokenize(text):
+            v[zlib.crc32(t.encode()) % 256] += 1
+        return v / max(np.linalg.norm(v), 1e-9)
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self.embed(text)
+
+
+def test_fact_passage_skips_header():
+    p = fact_passage(HIGH, "公共危險")
+    assert p.startswith("公共危險：理由") and "酒後駕車" in p and "上訴人" not in p
+
+
+@pytest.fixture(scope="module")
+def jdb_vec(jdb, tmp_path_factory):
+    emb = BigramEmbedder()
+    out = tmp_path_factory.mktemp("vec")
+    docs = [d for d in DOCS if parse_judgment(d) and parse_judgment(d).kind == "判決"]
+    vecs = np.stack([emb.embed(fact_passage(d["JFULL"], d["JTITLE"])) for d in docs])
+    save_month(out, "裁判書_202405_1", [d["JID"] for d in docs], vecs, emb.name)
+    assert not list(out.glob("*.tmp*"))
+    jdb.vectors = JudgmentVectors(out, embedder=emb)
+    yield jdb
+    jdb.vectors = None
+
+
+def test_semantic_search(jdb_vec):
+    assert jdb_vec.vectors.count == 2
+    r = jdb_vec.search("酒後駕車撞死行人", mode="semantic")
+    assert r["mode"] == "semantic" and r["results"][0]["jid"].startswith("TCHM")
+    r = jdb_vec.search("詐欺 車手")
+    assert r["mode"] == "hybrid" and r["results"][0]["jid"].startswith("TPSM")
+    assert "keyword_rank" in r["results"][0]["match"]
+
+
+def test_similar_judgments(jdb_vec):
+    r = jdb_vec.similar("112台上1234")
+    assert [x["jid"][:4] for x in r["results"]] == ["TCHM"]
+
+
+def test_semantic_falls_back_without_vectors(jdb):
+    saved, jdb.vectors = jdb.vectors, None
+    try:
+        r = jdb.search("酒駕", mode="semantic")
+        assert r["mode"] == "keyword" and r["notes"]
+    finally:
+        jdb.vectors = saved
+
+
+class _FakeResp(io.BytesIO):
+    def __init__(self, data: bytes, length: int):
+        super().__init__(data)
+        self.headers = {"Content-Length": str(length)}
+
+
+def test_download_rejects_truncated_file(tmp_path, monkeypatch):
+    payload = b"R" * 4096
+    calls = []
+
+    def fake_get(url, token=None, timeout=60):
+        calls.append(1)
+        # 第一次只給一半（模擬斷線），第二次給完整檔案
+        return _FakeResp(payload[:2048] if len(calls) == 1 else payload, len(payload))
+
+    monkeypatch.setattr(update_judgments, "http_get", fake_get)
+    monkeypatch.setattr(update_judgments.time, "sleep", lambda s: None)
+    item = {"month": "202603", "fileset_id": 1, "format": "rar"}
+    path = update_judgments.download(item, tmp_path)
+    assert len(calls) == 2 and path.read_bytes() == payload

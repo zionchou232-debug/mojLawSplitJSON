@@ -11,6 +11,7 @@
     python mcp_server/update_judgments.py --raw-dir "G:\\我的雲端硬碟\\判決原始檔"
     python mcp_server/update_judgments.py --raw-dir ... --probe        # 只列出平台上有哪些月份，不下載
     python mcp_server/update_judgments.py --raw-dir ... --no-download  # 只匯入已經在資料夾裡的檔案
+    python mcp_server/update_judgments.py --raw-dir ... --no-download --reimport  # 程式更新後補收漏掉的
     python mcp_server/update_judgments.py --stats                      # 看資料庫現況
 
 也可以自己從瀏覽器下載壓縮檔丟進 --raw-dir，下次執行就會匯入。
@@ -19,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import datetime as dt
 import json
 import os
@@ -126,10 +128,17 @@ def download(item: dict, raw_dir: Path, token: str | None = None) -> Path:
     for attempt in range(4):
         try:
             with http_get(url, token, timeout=300) as r, open(part, "wb") as f:
+                expected = int(r.headers.get("Content-Length") or 0)
                 shutil.copyfileobj(r, f, length=1 << 20)
+            got = part.stat().st_size
+            # 連線中途斷掉時，有時不會丟出錯誤，只會拿到半個檔：核對大小，不對就重下
+            if expected and got != expected:
+                raise ConnectionError(f"檔案不完整（{got} / {expected} bytes）")
+            if got < 1024:
+                raise ConnectionError(f"檔案太小（{got} bytes），可能是錯誤訊息而不是壓縮檔")
             part.replace(dest)
             return dest
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
             log(f"  下載失敗（第 {attempt + 1} 次）：{e}")
             time.sleep(10 * (attempt + 1))
     raise RuntimeError(f"下載 {item['month']} 失敗")
@@ -198,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-new", type=int, default=0, help="這次最多下載幾個月（0 表示不限），第一次試跑可設 1")
     ap.add_argument("--probe", action="store_true", help="只列出平台上有哪些月份，不下載")
     ap.add_argument("--no-download", action="store_true", help="不下載，只匯入資料夾裡已有的檔案")
+    ap.add_argument("--reimport", action="store_true",
+                    help="重新掃描資料夾裡所有壓縮檔（程式更新後補收漏掉的判決；已有的判決會跳過）")
     ap.add_argument("--stats", action="store_true", help="顯示資料庫現況後結束")
     a = ap.parse_args(argv)
 
@@ -253,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     # 2. 匯入還沒處理的壓縮檔
     name_index = load_name_index()
     archives = sorted(p for p in a.raw_dir.iterdir()
-                      if p.suffix.lower() in ARCHIVE_EXT and p.name not in done)
+                      if p.suffix.lower() in ARCHIVE_EXT and (a.reimport or p.name not in done))
     archives = [p for p in archives if (find_month(p.name) or "999999") >= since]
     if not archives:
         log("沒有新的檔案要匯入，資料庫已是最新")
@@ -267,8 +278,10 @@ def main(argv: list[str] | None = None) -> int:
             conn.rollback()
             log(f"  失敗，下次再試：{e}")
             continue
+        prev = conn.execute("SELECT added FROM ingested WHERE archive=?", (p.name,)).fetchone()
         conn.execute("INSERT OR REPLACE INTO ingested VALUES (?,?,?,?,?)",
-                     (p.name, find_month(p.name), added, scanned, dt.datetime.now().isoformat()))
+                     (p.name, find_month(p.name), added + (prev[0] if prev else 0), scanned,
+                      dt.datetime.now().isoformat()))
         conn.commit()
         log(f"  看過 {scanned} 份，新增刑事判決 {added} 份（{time.time() - t0:.0f} 秒）")
 

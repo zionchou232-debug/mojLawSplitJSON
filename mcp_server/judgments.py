@@ -139,17 +139,30 @@ def classify(full: str) -> str | None:
     return m.group(1) if m else None
 
 
+def classify_by_jid(full: str, code: str, word: str) -> str | None:
+    """標頭沒有「刑事判決」字樣時（宣示判決筆錄、少年法庭判決、開頭只有案號），
+    改看 JID：法院代碼第 4 碼 M 是刑事庭。附帶民事、社維法案件不收。"""
+    if len(code) < 4 or code[3] != "M" or "附民" in word or "秩" in word:
+        return None
+    head = _HEAD_RE.sub("", full[:300])[:120]
+    if "判決" in head:
+        return "判決"
+    if "裁定" in head:
+        return "裁定"
+    return None
+
+
 def parse_judgment(data: dict) -> Judgment | None:
     """把開放資料的一個 JSON 轉成 Judgment；不是刑事裁判或欄位不全時回傳 None。"""
     jid = (data.get("JID") or "").strip()
     full = (data.get("JFULL") or "").replace("\r\n", "\n").replace("\r", "\n")
     if not jid or not full:
         return None
-    kind = classify(full)
-    if kind is None:
-        return None
     parts = jid.split(",")
     code = parts[0] if parts else ""
+    kind = classify(full) or classify_by_jid(full, code, data.get("JCASE") or (parts[2] if len(parts) > 2 else ""))
+    if kind is None:
+        return None
     try:
         year = int(data.get("JYEAR") or parts[1])
         no = int(data.get("JNO") or parts[3])
@@ -166,6 +179,24 @@ def parse_judgment(data: dict) -> Judgment | None:
                     year=year, case_word=word, case_no=no, jdate=jdate,
                     title=(data.get("JTITLE") or "").strip(), kind=kind,
                     main_text=main_text, full=full)
+
+
+# ---------------------------------------------------------------- 語意向量用的段落
+
+_FACT_HEAD_RE = re.compile(r"\n\s*(犯\s*罪\s*事\s*實|事\s*實\s*及\s*理\s*由|事\s*實|理\s*由)\s*(?:\n|[一壹１1][、.．])")
+PASSAGE_CHARS = 1500
+
+
+def fact_passage(full: str, title: str = "", max_chars: int = PASSAGE_CHARS) -> str:
+    """送進語意模型的文字：案由 + 主文之後的事實／理由前段（去掉空白）。
+
+    Colab 算向量和本機查詢都用這個函式，兩邊才會一致。
+    """
+    text = (full or "").replace("\r\n", "\n").replace("\r", "\n")
+    m = _FACT_HEAD_RE.search(text)
+    body = text[m.start():] if m else text
+    body = re.sub(r"\s+", "", body)
+    return (f"{title}：" if title else "") + body[:max_chars]
 
 
 # ---------------------------------------------------------------- 法條引用
@@ -275,7 +306,7 @@ def parse_case_number(text: str) -> dict | None:
 # ---------------------------------------------------------------- 查詢
 
 class JudgmentDB:
-    def __init__(self, db_path: Path = JUDGMENT_DB_PATH, law_db=None):
+    def __init__(self, db_path: Path = JUDGMENT_DB_PATH, law_db=None, vectors=None):
         if not db_path.exists():
             raise FileNotFoundError(
                 f"找不到判決資料庫 {db_path}，請先執行：python mcp_server/update_judgments.py"
@@ -283,6 +314,7 @@ class JudgmentDB:
         self.conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.law_db = law_db
+        self.vectors = vectors  # JudgmentVectors 或 None
 
     # ------------------------------------------------------------ 共用
 
@@ -362,9 +394,18 @@ class JudgmentDB:
 
     # ------------------------------------------------------------ 關鍵字搜尋
 
-    def search(self, query: str, court: str | None = None, level: str | None = None,
-               year_from: int | None = None, year_to: int | None = None, limit: int = 10) -> dict:
-        limit = max(1, min(int(limit), 50))
+    def _rows_by_jids(self, jids: list[str], where: list[str], params: list) -> dict[str, sqlite3.Row]:
+        out: dict[str, sqlite3.Row] = {}
+        for i in range(0, len(jids), 500):
+            chunk = jids[i:i + 500]
+            cond = [f"j.jid IN ({','.join('?' * len(chunk))})"] + where
+            for r in self.conn.execute(f"SELECT j.* FROM judgments j WHERE {' AND '.join(cond)}",
+                                       chunk + params):
+                out[r["jid"]] = r
+        return out
+
+    def _keyword_ranked(self, query: str, where: list[str], params: list
+                        ) -> tuple[list[tuple[float, sqlite3.Row]], list[str], list[str]]:
         notes: list[str] = []
         expanded: list[str] = []
         if self.law_db is not None:
@@ -374,19 +415,16 @@ class JudgmentDB:
         base = list(dict.fromkeys(tokenize(query)))
         syn = [t for t in dict.fromkeys(tokenize(" ".join(expanded))) if t not in base]
         tokens = base + syn
+        terms = [t for t in re.split(r"[\s,，、;；]+", query) if len(t) >= 2] + expanded
         if not tokens:
-            return {"results": [], "notes": ["查詢內容太短或只有標點"]}
+            return [], notes, terms
         match = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
-        where, params = self._filters(court, level, year_from, year_to)
-        where.insert(0, "judgments_fts MATCH ?")
-        params.insert(0, match)
         rows = self.conn.execute(
             f"""SELECT j.*, bm25(judgments_fts, 2.0, 1.0) AS bm
                 FROM judgments_fts JOIN judgments j ON j.id = judgments_fts.rowid
-                WHERE {' AND '.join(where)} ORDER BY bm LIMIT 300""",
-            params,
+                WHERE {' AND '.join(["judgments_fts MATCH ?"] + where)} ORDER BY bm LIMIT 300""",
+            [match] + params,
         ).fetchall()
-        terms = [t for t in re.split(r"[\s,，、;；]+", query) if len(t) >= 2] + expanded
         scored = []
         for r in rows:
             head = decompress(r["full_z"])[:INDEX_CHARS]
@@ -395,17 +433,83 @@ class JudgmentDB:
             hits = sum(1 for t in terms if t in r["title"] or t in head)
             score = -r["bm"] * (0.4 + cov) * (1 + 0.25 * min(hits, 4))
             score *= {"最高法院": 1.2, "高等法院": 1.1}.get(r["level"], 1.0)
-            scored.append((score, r, head))
+            scored.append((score, r))
         scored.sort(key=lambda x: x[0], reverse=True)
+        return scored, notes, terms
+
+    def search(self, query: str, court: str | None = None, level: str | None = None,
+               year_from: int | None = None, year_to: int | None = None, limit: int = 10,
+               mode: str = "auto") -> dict:
+        """mode：auto（有向量就混合）、hybrid、keyword（只用關鍵字）、semantic（只用語意）。"""
+        limit = max(1, min(int(limit), 50))
+        if mode not in ("auto", "hybrid", "keyword", "semantic"):
+            return {"results": [], "notes": [f"不認得的搜尋模式「{mode}」"]}
+        notes: list[str] = []
+        if mode == "auto":
+            mode = "hybrid" if self.vectors is not None else "keyword"
+        elif mode != "keyword" and self.vectors is None:
+            notes.append("還沒有判決向量（見 README「判決語意搜尋」），改用關鍵字搜尋")
+            mode = "keyword"
+        where, params = self._filters(court, level, year_from, year_to)
+
+        kw: list[tuple[float, sqlite3.Row]] = []
+        terms = [t for t in re.split(r"[\s,，、;；]+", query) if len(t) >= 2]
+        if mode in ("hybrid", "keyword"):
+            kw, kw_notes, terms = self._keyword_ranked(query, where, params)
+            notes += kw_notes
+        sem: list[tuple[sqlite3.Row, float]] = []
+        if mode in ("hybrid", "semantic"):
+            hits = self.vectors.search(query, top_k=1000)
+            rows = self._rows_by_jids([j for j, _ in hits], where, params)
+            sem = [(rows[j], sim) for j, sim in hits if j in rows]
+
+        # 混合：Reciprocal Rank Fusion，兩邊名次都前面的排最前面
+        fused: dict[str, dict] = {}
+        for rank, (score, r) in enumerate(kw, 1):
+            fused[r["jid"]] = {"row": r, "rrf": 1 / (60 + rank), "keyword_rank": rank}
+        for rank, (r, sim) in enumerate(sem, 1):
+            d = fused.setdefault(r["jid"], {"row": r, "rrf": 0.0})
+            d["rrf"] += 1 / (60 + rank)
+            d["semantic_rank"], d["similarity"] = rank, round(sim, 3)
+        ranked = sorted(fused.values(), key=lambda d: -d["rrf"])
+
         results = []
-        for score, r, head in scored[:limit]:
-            d = self._summary(r)
-            d["snippet"] = make_snippet(head, terms, width=120)
-            d["score"] = round(score, 3)
-            results.append(d)
+        for d in ranked[:limit]:
+            r = d["row"]
+            out = self._summary(r)
+            head = decompress(r["full_z"])
+            out["snippet"] = make_snippet(head[:INDEX_CHARS] if terms else fact_passage(head)[:400],
+                                          terms, width=120)
+            out["match"] = {k: d[k] for k in ("keyword_rank", "semantic_rank", "similarity") if k in d}
+            results.append(out)
         if not results:
             notes.append("沒有找到相關判決，可以換個說法、放寬法院或年份")
-        return {"query": query, "results": results, "notes": notes}
+        return {"query": query, "mode": mode, "results": results, "notes": notes}
+
+    def similar(self, case: str, court: str | None = None, level: str | None = None,
+                year_from: int | None = None, year_to: int | None = None, limit: int = 10) -> dict:
+        """找跟某件判決事實最像的其他判決（要有向量）。"""
+        if self.vectors is None:
+            return {"results": [], "notes": ["還沒有判決向量，無法找相似判決（見 README「判決語意搜尋」）"]}
+        base = self.get(case, max_chars=1000)
+        if not base.get("found"):
+            return {"results": [], "notes": [base.get("reason", "找不到這個案號")],
+                    "candidates": base.get("candidates", [])}
+        hits = self.vectors.similar_to(base["jid"], top_k=1000)
+        if hits is None:
+            return {"results": [], "notes": ["這件判決還沒有向量（可能是 Colab 還沒算到那個月）"]}
+        where, params = self._filters(court, level, year_from, year_to)
+        rows = self._rows_by_jids([j for j, _ in hits], where, params)
+        results = []
+        for jid, sim in hits:
+            if jid in rows:
+                out = self._summary(rows[jid])
+                out["snippet"] = fact_passage(decompress(rows[jid]["full_z"]))[:300]
+                out["similarity"] = round(sim, 3)
+                results.append(out)
+                if len(results) >= max(1, min(int(limit), 50)):
+                    break
+        return {"base": base["case"], "results": results, "notes": []}
 
     # ------------------------------------------------------------ 依法條
 
