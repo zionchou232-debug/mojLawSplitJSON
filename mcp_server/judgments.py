@@ -139,17 +139,30 @@ def classify(full: str) -> str | None:
     return m.group(1) if m else None
 
 
+def classify_by_jid(full: str, code: str, word: str) -> str | None:
+    """標頭沒有「刑事判決」字樣時（宣示判決筆錄、少年法庭判決、開頭只有案號），
+    改看 JID：法院代碼第 4 碼 M 是刑事庭。附帶民事、社維法案件不收。"""
+    if len(code) < 4 or code[3] != "M" or "附民" in word or "秩" in word:
+        return None
+    head = _HEAD_RE.sub("", full[:300])[:120]
+    if "判決" in head:
+        return "判決"
+    if "裁定" in head:
+        return "裁定"
+    return None
+
+
 def parse_judgment(data: dict) -> Judgment | None:
     """把開放資料的一個 JSON 轉成 Judgment；不是刑事裁判或欄位不全時回傳 None。"""
     jid = (data.get("JID") or "").strip()
     full = (data.get("JFULL") or "").replace("\r\n", "\n").replace("\r", "\n")
     if not jid or not full:
         return None
-    kind = classify(full)
-    if kind is None:
-        return None
     parts = jid.split(",")
     code = parts[0] if parts else ""
+    kind = classify(full) or classify_by_jid(full, code, data.get("JCASE") or (parts[2] if len(parts) > 2 else ""))
+    if kind is None:
+        return None
     try:
         year = int(data.get("JYEAR") or parts[1])
         no = int(data.get("JNO") or parts[3])

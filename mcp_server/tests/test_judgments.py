@@ -85,6 +85,7 @@ def jdb(tmp_path_factory, law_db):
     args = ["--raw-dir", str(raw), "--db", str(db_path), "--no-download", "--months", "1200"]
     assert update_judgments.main(args) == 0
     assert update_judgments.main(args) == 0  # 重跑不會重複匯入
+    assert update_judgments.main(args + ["--reimport"]) == 0  # 重新掃描也不會重複
     return JudgmentDB(db_path, law_db=law_db)
 
 
@@ -94,6 +95,19 @@ def test_classify():
     assert classify(CIVIL) is None
     assert classify(INCIDENTAL_CIVIL) is None
     assert classify("臺灣臺北地方法院刑事簡易判決\n113年度簡字第1號") == "判決"
+
+
+@pytest.mark.parametrize("jid,case,full,want", [
+    ("ILDM,111,訴,229,20231228,2", "訴", "臺灣宜蘭地方法院宣示判決筆錄\n111年度訴字第229號\n公訴人", "判決"),
+    ("TPHM,112,少上訴,18,20231201,1", "少上訴", "臺灣高等法院少年法庭判決\n112年度少上訴字第18號", "判決"),
+    ("TNDM,112,易,1118,20231205,1", "易", "112年度易字第1118號\n公訴人 臺灣臺南地方檢察署\n判決如下", "判決"),
+    ("TPDM,112,附民,5,20231205,1", "附民", "臺灣臺北地方法院判決\n112年度附民字第5號", None),
+    ("TPDM,112,秩,5,20231205,1", "秩", "臺灣臺北地方法院裁定\n112年度秩字第5號", None),
+    ("TPDV,112,訴,5,20231205,1", "訴", "臺灣臺北地方法院判決", None),
+])
+def test_classify_by_jid_fallback(jid, case, full, want):
+    j = parse_judgment({"JID": jid, "JCASE": case, "JFULL": full, "JTITLE": ""})
+    assert (j.kind if j else None) == want
 
 
 def test_parse_judgment_court():
