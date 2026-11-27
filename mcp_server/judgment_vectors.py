@@ -7,7 +7,7 @@ Google Drive 電腦版會把這個資料夾同步成本機路徑（例如 G:\\�
 設定環境變數 JUDGMENT_VECTOR_DIR 指過去就能用，不必手動下載。
 
 查詢時要用跟 Colab 一樣的模型把查詢轉成向量。預設 BAAI/bge-m3：
-- 優先用 fastembed 載入官方 ONNX 檔（不用裝 PyTorch，第一次會下載約 2.3GB）
+- 優先用 fastembed 載入官方 ONNX 檔（不用裝 PyTorch，第一次會下載約 2.3GB 到 mcp_server/models/）
 - 沒有 fastembed 時改用 sentence-transformers
 """
 
@@ -23,6 +23,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 JUDGMENT_VECTOR_DIR = Path(os.environ.get("JUDGMENT_VECTOR_DIR", HERE / "judgment_vectors"))
 JUDGMENT_EMBED_MODEL = os.environ.get("JUDGMENT_EMBED_MODEL", "BAAI/bge-m3")
+# 模型檔放固定位置；fastembed 預設放系統暫存資料夾，可能被 Windows 磁碟清理刪掉而要重新下載 2.3GB
+MODEL_CACHE_DIR = Path(os.environ.get("FASTEMBED_CACHE_PATH", HERE / "models"))
 CHUNK = 50_000  # 一次拿多少列轉成 float32 做矩陣乘法，控制記憶體
 
 
@@ -53,7 +55,7 @@ class FastEmbedBgeM3:
         except ValueError:
             pass  # 已經註冊過
         self.name = model
-        self._model = TextEmbedding(model_name=model)
+        self._model = TextEmbedding(model_name=model, cache_dir=str(MODEL_CACHE_DIR))
 
     def embed_query(self, text: str) -> np.ndarray:
         return _normalize(np.array(list(self._model.embed([text])))[0])

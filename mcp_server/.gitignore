@@ -7,3 +7,4 @@ judgments.db-wal
 judgments.db-shm
 vectors/
 judgment_vectors/
+models/
