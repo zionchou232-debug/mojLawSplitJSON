@@ -18,6 +18,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 VECTOR_DIR = Path(os.environ.get("LAW_VECTOR_DIR", HERE / "vectors"))
 DEFAULT_MODEL = os.environ.get("LAW_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
+# 模型放在 mcp_server/models，避免 Windows 清理暫存資料夾後要重新下載（與 judgment_vectors.py 共用）
+MODEL_CACHE_DIR = Path(os.environ.get("FASTEMBED_CACHE_PATH", HERE / "models"))
 
 # bge 中文模型建議查詢時加上這段指令（條文本身不用加）
 QUERY_PREFIX = {
@@ -39,13 +41,13 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 
 
 class FastEmbedder:
-    """用 fastembed 載入模型。第一次使用會自動下載模型（約 100MB）。"""
+    """用 fastembed 載入模型。第一次使用會自動下載模型（約 100MB）到 mcp_server/models。"""
 
     def __init__(self, model: str = DEFAULT_MODEL, threads: int | None = None):
         from fastembed import TextEmbedding  # 延後匯入：沒裝也不影響關鍵字搜尋
 
         self.name = model
-        self._model = TextEmbedding(model_name=model, threads=threads)
+        self._model = TextEmbedding(model_name=model, threads=threads, cache_dir=str(MODEL_CACHE_DIR))
         self._prefix = QUERY_PREFIX.get(model, "")
 
     def embed_documents(self, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
